@@ -1,6 +1,6 @@
-# SillyTavern Viewer (Android 局域网酒馆专用轻量客户端)
+# 简单的酒馆客户端
 
-专为移动端访问局域网 **SillyTavern（酒馆）** 打造的原生 Android (Kotlin) 轻量级 WebView 容器，自带 GitHub Actions 云端自动编译 Debug APK 工作流。
+移动端访问局域网更方便
 
 ---
 
@@ -28,12 +28,3 @@
 5. **防息屏常亮开关 (`FLAG_KEEP_SCREEN_ON`)**
    - 设置弹窗内置 **「保持屏幕常亮 (防息屏)」** 开关（默认开启，可随时自由切换并持久化保存），挂机等待长回复或生图时屏幕不会自动熄灭。
 
----
-
-## 使用 GitHub Actions 自动编译 APK
-
-本项目已配置好 [`.github/workflows/build-debug-apk.yml`](.github/workflows/build-debug-apk.yml)：
-
-1. 将本项目推送到你的 GitHub 仓库（`main` 或 `master` 分支）。
-2. 打开 GitHub 仓库顶部的 **Actions** 标签页（也可手动点击 `Build Debug APK` -> `Run workflow`）。
-3. 等待约 1~2 分钟构建完成后，在工作流运行详情页底部的 **Artifacts** 区域即可下载 **`SillyTavernViewer-debug-apk`**（内含 `SillyTavernViewer-debug.apk`），直接发送到手机安装即可使用。
