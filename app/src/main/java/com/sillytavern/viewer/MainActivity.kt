@@ -390,7 +390,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
     /**
      * 将网页的 accept 属性（可能包含 `.png`, `.json`, `.jsonl`, `.charx` 等扩展名或 MIME 类型）解析为 Android 支持的 MIME 列表。
-     * 注意：部分国产手机系统的文件管理器对 `application/json` 过滤较严，因此若包含 json/jsonl/charx/txt 等格式，保留 `*/*` 通配以确保所有文件可选。
+     * 注意：部分国产手机系统的文件管理器对 `application/json` 过滤较严，因此若包含 json/jsonl/charx/txt 等格式，保留 `` 通配以确保所有文件可选。
      */
     private fun resolveAcceptMimeTypes(rawTypes: List<String>): List<String> {
         if (rawTypes.isEmpty()) return emptyList()
