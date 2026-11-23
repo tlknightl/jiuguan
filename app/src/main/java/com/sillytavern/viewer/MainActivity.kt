@@ -12,11 +12,15 @@ import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.net.Uri
+import android.net.http.SslError
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.os.PowerManager
 import android.os.SystemClock
 import android.provider.MediaStore
+import android.provider.Settings
+import android.text.InputType
 import android.util.Base64
 import android.view.LayoutInflater
 import android.view.View
@@ -24,8 +28,10 @@ import android.view.ViewGroup
 import android.view.WindowManager
 import android.webkit.CookieManager
 import android.webkit.DownloadListener
+import android.webkit.HttpAuthHandler
 import android.webkit.JavascriptInterface
 import android.webkit.MimeTypeMap
+import android.webkit.SslErrorHandler
 import android.webkit.URLUtil
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
@@ -36,6 +42,7 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
@@ -61,6 +68,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         private const val PREFS_NAME = "silly_tavern_prefs"
         private const val KEY_SERVER_URL = "server_url"
         private const val KEY_KEEP_SCREEN_ON = "keep_screen_on"
+        private const val KEY_KEEP_BG_ALIVE = "keep_bg_alive"
         private const val KEY_SHOW_FLOATING_BTN = "show_floating_btn"
 
         private const val DEFAULT_URL_TEMPLATE = "http://192.168.1.100:8000"
@@ -92,6 +100,9 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     // 最近一次触发 <a download="xxx"> 的文件名缓存（辅助 blob: URL 还原真实文件名）
     @Volatile
     private var lastClickedDownloadFilename: String? = null
+
+    // 云酒馆 HTTP 基础认证（basicAuthMode）凭据缓存，键为「主机|realm」
+    private val authCache = mutableMapOf<String, Pair<String, String>>()
 
     private val fileChooserLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -145,6 +156,10 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         val keepScreenOn = prefs.getBoolean(KEY_KEEP_SCREEN_ON, true)
         applyKeepScreenOn(keepScreenOn)
 
+        // 2.5 应用“强制后台运行”防切屏/息屏被系统杀后台设置（默认开启）
+        val keepBgAlive = prefs.getBoolean(KEY_KEEP_BG_ALIVE, true)
+        applyKeepBackgroundAlive(keepBgAlive, askBatteryOptimization = false)
+
         // 3. 应用右上角半透明快捷按钮显示状态
         val showFloatingBtn = prefs.getBoolean(KEY_SHOW_FLOATING_BTN, true)
         applyFloatingButtonVisibility(showFloatingBtn)
@@ -168,8 +183,9 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         setupBackPressInterceptor()
 
         // 7. 检查本地持久化保存的酒馆地址：首次打开弹出输入框，已保存则直接加载
+        //    若历史地址是 127.0.0.1 / localhost 这类回环地址（手机上永远连不通电脑），则重新弹出设置框引导修改
         val savedUrl = prefs.getString(KEY_SERVER_URL, null)?.trim().orEmpty()
-        if (savedUrl.isEmpty()) {
+        if (savedUrl.isEmpty() || isLoopbackHost(normalizeServerUrl(savedUrl))) {
             showSettingsDialog(isFirstLaunch = true)
         } else {
             loadTavernUrl(savedUrl)
@@ -220,6 +236,32 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         }
         webView.keepScreenOn = enabled
+    }
+
+    /**
+     * 强制后台运行开关（启动前台常驻服务 + CPU 唤醒锁 + 申请忽略系统电池优化白名单）
+     * 防止用户在等待酒馆 AI 生成长回复时切换到微信/其他软件或锁屏后，被系统冻结或杀后台导致生成断连。
+     */
+    @SuppressLint("BatteryLife")
+    private fun applyKeepBackgroundAlive(enabled: Boolean, askBatteryOptimization: Boolean) {
+        if (enabled) {
+            KeepAliveService.start(this)
+            if (askBatteryOptimization && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                try {
+                    val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
+                    if (pm != null && !pm.isIgnoringBatteryOptimizations(packageName)) {
+                        val intent = Intent(
+                            Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                            Uri.parse("package:$packageName")
+                        )
+                        startActivity(intent)
+                    }
+                } catch (_: Exception) {
+                }
+            }
+        } else {
+            KeepAliveService.stop(this)
+        }
     }
 
     private fun applyFloatingButtonVisibility(visible: Boolean) {
@@ -320,6 +362,49 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                     renderOfflineErrorPage(failingUrl, desc)
                 }
             }
+
+            /**
+             * 云酒馆 / 开了 basicAuthMode 的酒馆会返回 401 要求 HTTP 基础认证。
+             * Android WebView 默认【不会】自己弹登录框，必须手动接管，否则页面只会是一片白屏。
+             */
+            override fun onReceivedHttpAuthRequest(
+                view: WebView?,
+                handler: HttpAuthHandler,
+                host: String,
+                realm: String
+            ) {
+                val key = "$host|$realm"
+                val cached = authCache[key]
+                if (cached != null) {
+                    handler.proceed(cached.first, cached.second)
+                    return
+                }
+                showHttpAuthDialog(handler, host, realm) { user, pass ->
+                    authCache[key] = user to pass
+                    webView.setHttpAuthUsernamePassword(host, realm, user, pass)
+                }
+            }
+
+            /**
+             * 自建云酒馆常用自签证书，证书无效时 WebView 会直接白屏。
+             * 这里明确告知风险，由用户自己决定是否继续访问。
+             */
+            override fun onReceivedSslError(
+                view: WebView?,
+                handler: SslErrorHandler,
+                error: SslError?
+            ) {
+                AlertDialog.Builder(this@MainActivity)
+                    .setTitle("证书不受信任")
+                    .setMessage(
+                        "该地址的 HTTPS 证书无效或已过期，常见于自建服务器未配置正式证书。\n\n" +
+                            "继续访问会降低连接安全性（可能被中间人窃听）。确定要继续吗？"
+                    )
+                    .setCancelable(false)
+                    .setPositiveButton("继续访问") { _, _ -> handler.proceed() }
+                    .setNegativeButton("取消") { _, _ -> handler.cancel() }
+                    .show()
+            }
         }
 
         // 完整实现 onShowFileChooser：支持导入 PNG 角色卡、JSON 世界书/预设/正则/聊天记录等任意文件
@@ -390,7 +475,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
     /**
      * 将网页的 accept 属性（可能包含 `.png`, `.json`, `.jsonl`, `.charx` 等扩展名或 MIME 类型）解析为 Android 支持的 MIME 列表。
-     * 注意：部分国产手机系统的文件管理器对 `application/json` 过滤较严，因此若包含 json/jsonl/charx/txt 等格式，保留 `` 通配以确保所有文件可选。
+     * 注意：部分国产手机系统的文件管理器对 `application/json` 过滤较严，因此若包含 json/jsonl/charx/txt 等格式，保留通配符以确保所有文件可选。
      */
     private fun resolveAcceptMimeTypes(rawTypes: List<String>): List<String> {
         if (rawTypes.isEmpty()) return emptyList()
@@ -753,6 +838,67 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         return url
     }
 
+    /**
+     * 弹出酒馆账号密码输入框（用于云酒馆 / 开启 basicAuthMode 的公网酒馆）
+     */
+    private fun showHttpAuthDialog(
+        handler: HttpAuthHandler,
+        host: String,
+        realm: String,
+        onCredentials: (String, String) -> Unit
+    ) {
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(22), dp(12), dp(22), 0)
+        }
+        val etUser = EditText(this).apply {
+            hint = "用户名"
+            inputType = InputType.TYPE_CLASS_TEXT
+            setSingleLine()
+        }
+        val etPass = EditText(this).apply {
+            hint = "密码"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+            setSingleLine()
+        }
+        container.addView(etUser)
+        container.addView(etPass)
+
+        AlertDialog.Builder(this)
+            .setTitle("酒馆需要登录")
+            .setMessage(
+                "服务器 $host 要求输入账号密码（即酒馆配置里 basicAuthMode 设置的账号）。\n" +
+                    "认证域：${realm.ifBlank { "默认" }}"
+            )
+            .setView(container)
+            .setCancelable(false)
+            .setPositiveButton("登录") { _, _ ->
+                val user = etUser.text?.toString().orEmpty()
+                val pass = etPass.text?.toString().orEmpty()
+                onCredentials(user, pass)
+                handler.proceed(user, pass)
+            }
+            .setNegativeButton("取消") { _, _ -> handler.cancel() }
+            .show()
+    }
+
+    private fun dp(value: Int): Int =
+        (value * resources.displayMetrics.density + 0.5f).toInt()
+
+    /**
+     * 判断地址是否为「手机自己」的回环地址（127.0.0.1 / localhost / 0.0.0.0）。
+     * 手机里的 127.0.0.1 指向手机本身，所以永远无法访问电脑上的酒馆，必须改成电脑的局域网 IP。
+     */
+    private fun isLoopbackHost(url: String): Boolean {
+        if (url.isBlank()) return false
+        val host = try {
+            Uri.parse(url).host?.lowercase(Locale.ROOT).orEmpty()
+        } catch (e: Exception) {
+            ""
+        }
+        return host == "127.0.0.1" || host == "localhost" || host == "::1" || host == "0.0.0.0"
+    }
+
     private fun loadTavernUrl(rawUrl: String) {
         val finalUrl = normalizeServerUrl(rawUrl)
         if (finalUrl.isEmpty()) {
@@ -845,9 +991,12 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                     <p>错误信息：$errorDescription</p>
                     <div class="tips">
                         <strong>排查建议：</strong><br/>
-                        1. 确认手机与运行 SillyTavern 的电脑处于同一 Wi-Fi / 局域网。<br/>
-                        2. 确认酒馆 <span class="code">config.yaml</span> 中已开启 <span class="code">listen: true</span> 并放行防火墙端口。<br/>
-                        3. 点击屏幕<strong>右上角半透明小齿轮</strong>（或<strong>摇一摇手机</strong>）修改 IP 与端口。
+                        1. 不要填 127.0.0.1 或 localhost：它们在手机里指的是手机自己，请填电脑的局域网 IP（如 192.168.1.100）。<br/>
+                        2. 确认手机与运行 SillyTavern 的电脑连接同一个 Wi-Fi / 路由器。<br/>
+                        3. 确认酒馆 <span class="code">config.yaml</span> 中已开启 <span class="code">listen: true</span>，并把 <span class="code">whitelistMode</span> 设为 false 或加入手机 IP。<br/>
+                        4. 确认电脑防火墙已放行 8000 端口（Windows 首次运行 Node.js 时弹窗要选“允许访问”）。<br/>
+                        5. 先用手机浏览器打开同一地址试一下，能打开说明网络通了，再回到本 App。<br/>
+                        6. 点击屏幕<strong>右上角半透明小齿轮</strong>（或<strong>摇一摇手机</strong>）修改 IP 与端口。
                     </div>
                     <a class="btn" href="$failingUrl">重新连接</a>
                 </div>
@@ -868,6 +1017,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         val dialogView = LayoutInflater.from(this).inflate(R.layout.dialog_settings, null)
         val etServerUrl = dialogView.findViewById<EditText>(R.id.etServerUrl)
         val switchKeepScreenOn = dialogView.findViewById<SwitchCompat>(R.id.switchKeepScreenOn)
+        val switchKeepBgAlive = dialogView.findViewById<SwitchCompat>(R.id.switchKeepBgAlive)
         val switchShowFloatingBtn = dialogView.findViewById<SwitchCompat>(R.id.switchShowFloatingBtn)
 
         val currentUrl = prefs.getString(KEY_SERVER_URL, null)
@@ -879,6 +1029,9 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         val currentKeepScreenOn = prefs.getBoolean(KEY_KEEP_SCREEN_ON, true)
         switchKeepScreenOn.isChecked = currentKeepScreenOn
 
+        val currentKeepBgAlive = prefs.getBoolean(KEY_KEEP_BG_ALIVE, true)
+        switchKeepBgAlive.isChecked = currentKeepBgAlive
+
         val currentShowFloating = prefs.getBoolean(KEY_SHOW_FLOATING_BTN, true)
         switchShowFloatingBtn.isChecked = currentShowFloating
 
@@ -887,6 +1040,14 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             prefs.edit().putBoolean(KEY_KEEP_SCREEN_ON, isChecked).apply()
             applyKeepScreenOn(isChecked)
             val msgRes = if (isChecked) R.string.screen_on_enabled else R.string.screen_on_disabled
+            Toast.makeText(this, getString(msgRes), Toast.LENGTH_SHORT).show()
+        }
+
+        // 实时切换强制后台运行（防切屏/息屏被系统杀后台断连）开关
+        switchKeepBgAlive.setOnCheckedChangeListener { _, isChecked ->
+            prefs.edit().putBoolean(KEY_KEEP_BG_ALIVE, isChecked).apply()
+            applyKeepBackgroundAlive(isChecked, askBatteryOptimization = isChecked)
+            val msgRes = if (isChecked) R.string.bg_alive_enabled else R.string.bg_alive_disabled
             Toast.makeText(this, getString(msgRes), Toast.LENGTH_SHORT).show()
         }
 
@@ -924,13 +1085,28 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                     return@setOnClickListener
                 }
 
+                // 127.0.0.1 / localhost 在手机里指向手机自己，连不到电脑上的酒馆，直接拦截并给出正确写法
+                if (isLoopbackHost(normalized)) {
+                    Toast.makeText(
+                        this,
+                        "127.0.0.1 和 localhost 指的是手机自己，连不到电脑上的酒馆。\n请填写电脑的局域网 IP，例如 http://192.168.1.100:8000",
+                        Toast.LENGTH_LONG
+                    ).show()
+                    return@setOnClickListener
+                }
+
                 prefs.edit()
                     .putString(KEY_SERVER_URL, normalized)
                     .putBoolean(KEY_KEEP_SCREEN_ON, switchKeepScreenOn.isChecked)
+                    .putBoolean(KEY_KEEP_BG_ALIVE, switchKeepBgAlive.isChecked)
                     .putBoolean(KEY_SHOW_FLOATING_BTN, switchShowFloatingBtn.isChecked)
                     .apply()
 
                 applyKeepScreenOn(switchKeepScreenOn.isChecked)
+                applyKeepBackgroundAlive(
+                    switchKeepBgAlive.isChecked,
+                    askBatteryOptimization = switchKeepBgAlive.isChecked
+                )
                 applyFloatingButtonVisibility(switchShowFloatingBtn.isChecked)
                 dialog.dismiss()
                 loadTavernUrl(normalized)
@@ -986,6 +1162,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     }
 
     override fun onDestroy() {
+        KeepAliveService.stop(this)
         settingsDialog?.dismiss()
         (webView.parent as? ViewGroup)?.removeView(webView)
         webView.stopLoading()

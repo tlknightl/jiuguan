@@ -37,7 +37,7 @@
             android:layout_height="wrap_content"
             android:layout_marginTop="4dp"
             android:alpha="0.75"
-            android:text="提示：若不填 http:// 将自动补全；支持局域网明文 HTTP 与 HTTPS。"
+            android:text="⚠ 不要填 127.0.0.1 或 localhost（那是手机自己）。\n家里电脑跑酒馆：填电脑局域网 IP，例如 http://192.168.1.100:8000\n云酒馆 / 公网酒馆：填服务商给的完整地址，例如 https://xxx.com（带子路径要一起写上）\n不填 http:// 会自动补全。"
             android:textSize="11sp" />
 
         <androidx.appcompat.widget.SwitchCompat
@@ -46,6 +46,14 @@
             android:layout_height="wrap_content"
             android:layout_marginTop="14dp"
             android:text="@string/keep_screen_on"
+            android:textSize="14sp" />
+
+        <androidx.appcompat.widget.SwitchCompat
+            android:id="@+id/switchKeepBgAlive"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="@string/keep_background_alive"
             android:textSize="14sp" />
 
         <androidx.appcompat.widget.SwitchCompat
