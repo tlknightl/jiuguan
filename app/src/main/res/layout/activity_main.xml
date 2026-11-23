@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/rootContainer"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#0E0D12">
+
+    <WebView
+        android:id="@+id/webView"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:focusable="true"
+        android:focusableInTouchMode="true" />
+
+    <!-- 顶部极细加载进度条 -->
+    <ProgressBar
+        android:id="@+id/progressBar"
+        style="?android:attr/progressBarStyleHorizontal"
+        android:layout_width="match_parent"
+        android:layout_height="2dp"
+        android:layout_gravity="top"
+        android:max="100"
+        android:visibility="gone" />
+
+    <!-- 右上角不显眼的半透明微型设置按钮（支持点击呼出设置弹窗、长按快速刷新，可在设置中隐藏并仅用摇一摇触发） -->
+    <TextView
+        android:id="@+id/btnQuickSettings"
+        android:layout_width="28dp"
+        android:layout_height="28dp"
+        android:layout_gravity="top|end"
+        android:layout_marginTop="14dp"
+        android:layout_marginEnd="10dp"
+        android:alpha="0.35"
+        android:background="@drawable/bg_floating_gear"
+        android:contentDescription="@string/settings_title"
+        android:gravity="center"
+        android:text="⚙"
+        android:textColor="#E0FFFFFF"
+        android:textSize="14sp" />
+
+</FrameLayout>

@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">SillyTavern</string>
+    <string name="settings_title">酒馆连接与显示设置</string>
+    <string name="url_hint">例如 http://192.168.1.100:8000</string>
+    <string name="keep_screen_on">保持屏幕常亮 (防息屏)</string>
+    <string name="show_floating_btn">显示右上角半透明快捷按钮 (关闭后仍可摇一摇呼出)</string>
+    <string name="btn_save_and_load">保存并连接</string>
+    <string name="btn_reload">刷新当前页</string>
+    <string name="btn_cancel">取消</string>
+    <string name="btn_clear_cache">清理缓存</string>
+    <string name="back_exit_toast">再按一次退出酒馆</string>
+    <string name="url_empty_toast">请输入有效的局域网酒馆地址</string>
+    <string name="screen_on_enabled">已开启屏幕常亮</string>
+    <string name="screen_on_disabled">已关闭屏幕常亮</string>
+</resources>
