@@ -40,6 +40,37 @@
             android:text="⚠ 不要填 127.0.0.1 或 localhost（那是手机自己）。\n家里电脑跑酒馆：填电脑局域网 IP，例如 http://192.168.1.100:8000\n云酒馆 / 公网酒馆：填服务商给的完整地址，例如 https://xxx.com（带子路径要一起写上）\n不填 http:// 会自动补全。"
             android:textSize="11sp" />
 
+        <!-- 多账户密码管理与免解锁自动填入区 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                android:id="@+id/tvSavedAccountsSummary"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="已保存账户：0 个"
+                android:textSize="13sp"
+                android:textStyle="bold" />
+
+            <Button
+                android:id="@+id/btnManageAccounts"
+                style="?attr/borderlessButtonStyle"
+                android:layout_width="wrap_content"
+                android:layout_height="38dp"
+                android:minHeight="0dp"
+                android:paddingStart="12dp"
+                android:paddingTop="4dp"
+                android:paddingEnd="12dp"
+                android:paddingBottom="4dp"
+                android:text="@string/manage_accounts_btn"
+                android:textSize="13sp" />
+        </LinearLayout>
+
         <androidx.appcompat.widget.SwitchCompat
             android:id="@+id/switchKeepScreenOn"
             android:layout_width="match_parent"

@@ -40,10 +40,15 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.AdapterView
+import android.widget.ArrayAdapter
+import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ProgressBar
+import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
@@ -55,6 +60,8 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import org.json.JSONArray
+import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
 import java.text.SimpleDateFormat
@@ -71,6 +78,12 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         private const val KEY_KEEP_BG_ALIVE = "keep_bg_alive"
         private const val KEY_OPEN_EXTERNAL_BROWSER = "open_external_browser"
         private const val KEY_SHOW_FLOATING_BTN = "show_floating_btn"
+
+        // 多账户密码管理与免解锁自动填入持久化键
+        private const val KEY_SAVED_ACCOUNTS_JSON = "saved_accounts_json"
+        private const val KEY_DEFAULT_ACCOUNT_USER = "default_account_user"
+        private const val KEY_AUTO_FILL_ON_LOAD = "auto_fill_on_load"
+        private const val KEY_AUTO_LOGIN_HTTP_AUTH = "auto_login_http_auth"
 
         private const val DEFAULT_URL_TEMPLATE = "http://192.168.1.100:8000"
         private const val EXIT_CONFIRM_INTERVAL_MS = 2000L
@@ -109,6 +122,17 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
     // 云酒馆 HTTP 基础认证（basicAuthMode）凭据缓存，键为「主机|realm」
     private val authCache = mutableMapOf<String, Pair<String, String>>()
+
+    // 记录同一 host|realm 上次自动尝试登录的时间戳，用于检测密码错误避免无限死循环
+    private val lastHttpAuthAutoAttempt = mutableMapOf<String, Long>()
+
+    /**
+     * 多账户数据模型（保存在本地 SharedPreferences JSON 数组中）
+     */
+    data class SavedAccount(
+        val username: String,
+        val password: String
+    )
 
     private val fileChooserLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -450,6 +474,12 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         cookieManager.setAcceptCookie(true)
         cookieManager.setAcceptThirdPartyCookies(webView, true)
 
+        // 禁用 Android 系统自带的 Autofill 自动填充框架（彻底阻止点击密码框时系统弹窗索要“设备解锁码/锁屏密码”）
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            webView.importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS
+            window.decorView.importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS
+        }
+
         webView.settings.apply {
             javaScriptEnabled = true
             domStorageEnabled = true
@@ -459,6 +489,10 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             javaScriptCanOpenWindowsAutomatically = true
             setSupportMultipleWindows(true)
             mediaPlaybackRequiresUserGesture = false
+            @Suppress("DEPRECATION")
+            savePassword = false
+            @Suppress("DEPRECATION")
+            saveFormData = false
 
             // 放行 HTTP/HTTPS 混合内容（例如局域网 HTTP 酒馆引用外部资源或本地图床）
             mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
@@ -476,6 +510,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
         // 注入 JS 桥接：完美支持 SillyTavern 前端通过 Blob URL / Data URL 导出 JSON 角色卡、世界书、聊天记录和 PNG 角色卡
         webView.addJavascriptInterface(BlobDownloadBridge(), "STAndroidDownloader")
+        // 注入多账户免解锁自动填入与保存桥接
+        webView.addJavascriptInterface(AccountManagerBridge(), "STAccountBridge")
 
         webView.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(
@@ -510,6 +546,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 super.onPageFinished(view, url)
                 CookieManager.getInstance().flush()
                 injectDownloadHelperScript()
+                injectPasswordHelperScript()
             }
 
             override fun onReceivedError(
@@ -528,7 +565,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
             /**
              * 云酒馆 / 开了 basicAuthMode 的酒馆会返回 401 要求 HTTP 基础认证。
-             * Android WebView 默认【不会】自己弹登录框，必须手动接管，否则页面只会是一片白屏。
+             * 支持多账户选择、记住账号密码与自动登录（若刚自动尝试过仍返回 401 说明密码变动，自动降级为弹窗）。
              */
             override fun onReceivedHttpAuthRequest(
                 view: WebView?,
@@ -537,12 +574,38 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 realm: String
             ) {
                 val key = "$host|$realm"
-                val cached = authCache[key]
-                if (cached != null) {
-                    handler.proceed(cached.first, cached.second)
-                    return
+                val now = SystemClock.elapsedRealtime()
+                val lastAttempt = lastHttpAuthAutoAttempt[key] ?: 0L
+                val recentlyFailed = (now - lastAttempt) < 3500L
+
+                if (!recentlyFailed) {
+                    val cached = authCache[key]
+                    if (cached != null) {
+                        lastHttpAuthAutoAttempt[key] = now
+                        handler.proceed(cached.first, cached.second)
+                        return
+                    }
+                    // 检查是否开启了默认账户自动登录
+                    val autoLogin = prefs.getBoolean(KEY_AUTO_LOGIN_HTTP_AUTH, true)
+                    val defaultAccount = getDefaultSavedAccount()
+                    if (autoLogin && defaultAccount != null) {
+                        lastHttpAuthAutoAttempt[key] = now
+                        authCache[key] = defaultAccount.username to defaultAccount.password
+                        webView.setHttpAuthUsernamePassword(
+                            host,
+                            realm,
+                            defaultAccount.username,
+                            defaultAccount.password
+                        )
+                        handler.proceed(defaultAccount.username, defaultAccount.password)
+                        return
+                    }
+                } else {
+                    authCache.remove(key)
                 }
+
                 showHttpAuthDialog(handler, host, realm) { user, pass ->
+                    lastHttpAuthAutoAttempt[key] = SystemClock.elapsedRealtime()
                     authCache[key] = user to pass
                     webView.setHttpAuthUsernamePassword(host, realm, user, pass)
                 }
@@ -1036,7 +1099,440 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     }
 
     /**
+     * 供 WebView 内部调用的多账户密码免解锁自动填入与保存桥接类
+     */
+    inner class AccountManagerBridge {
+        @JavascriptInterface
+        fun getAccountsJson(): String {
+            return buildAccountStateJsonString()
+        }
+
+        @JavascriptInterface
+        fun saveAccountFromWeb(username: String?, password: String?) {
+            val u = username?.trim().orEmpty()
+            val p = password.orEmpty()
+            if (p.isEmpty()) return
+            val finalUser = u.ifEmpty { "默认用户" }
+            upsertSavedAccount(finalUser, p, setAsDefault = true)
+            runOnUiThread {
+                Toast.makeText(
+                    this@MainActivity,
+                    "已保存账户：$finalUser",
+                    Toast.LENGTH_SHORT
+                ).show()
+                refreshWebPasswordHelper()
+            }
+        }
+
+        @JavascriptInterface
+        fun selectDefaultAccountFromWeb(username: String?) {
+            val u = username?.trim().orEmpty()
+            if (u.isEmpty()) return
+            prefs.edit().putString(KEY_DEFAULT_ACCOUNT_USER, u).apply()
+        }
+
+        @JavascriptInterface
+        fun setAutoFillFromWeb(enabled: Boolean) {
+            prefs.edit().putBoolean(KEY_AUTO_FILL_ON_LOAD, enabled).apply()
+        }
+
+        @JavascriptInterface
+        fun openAccountManagerFromWeb() {
+            runOnUiThread {
+                showAccountManagerDialog(onChanged = {
+                    refreshWebPasswordHelper()
+                })
+            }
+        }
+    }
+
+    /**
+     * 读取本地持久化保存的所有账户列表
+     */
+    private fun loadSavedAccounts(): MutableList<SavedAccount> {
+        val raw = prefs.getString(KEY_SAVED_ACCOUNTS_JSON, null).orEmpty()
+        if (raw.isBlank()) return mutableListOf()
+        val list = mutableListOf<SavedAccount>()
+        try {
+            val arr = JSONArray(raw)
+            for (i in 0 until arr.length()) {
+                val obj = arr.optJSONObject(i) ?: continue
+                val u = obj.optString("u").trim()
+                val p = obj.optString("p")
+                if (u.isNotEmpty() || p.isNotEmpty()) {
+                    list.add(SavedAccount(u.ifEmpty { "默认用户" }, p))
+                }
+            }
+        } catch (_: Exception) {
+        }
+        return list
+    }
+
+    private fun saveAccountsList(accounts: List<SavedAccount>) {
+        val arr = JSONArray()
+        for (acc in accounts) {
+            val obj = JSONObject()
+            obj.put("u", acc.username)
+            obj.put("p", acc.password)
+            arr.put(obj)
+        }
+        prefs.edit().putString(KEY_SAVED_ACCOUNTS_JSON, arr.toString()).apply()
+    }
+
+    private fun getDefaultSavedAccount(): SavedAccount? {
+        val accounts = loadSavedAccounts()
+        if (accounts.isEmpty()) return null
+        val defUser = prefs.getString(KEY_DEFAULT_ACCOUNT_USER, null)?.trim().orEmpty()
+        if (defUser.isNotEmpty()) {
+            accounts.firstOrNull { it.username.equals(defUser, ignoreCase = true) }?.let {
+                return it
+            }
+        }
+        return accounts.first()
+    }
+
+    /**
+     * 新增或更新账户（按用户名去重更新，并可设为默认自动填充账户）
+     */
+    private fun upsertSavedAccount(username: String, password: String, setAsDefault: Boolean) {
+        val cleanUser = username.trim().ifEmpty { "默认用户" }
+        val accounts = loadSavedAccounts()
+        val idx = accounts.indexOfFirst { it.username.equals(cleanUser, ignoreCase = true) }
+        if (idx >= 0) {
+            accounts[idx] = SavedAccount(cleanUser, password)
+        } else {
+            accounts.add(0, SavedAccount(cleanUser, password))
+        }
+        saveAccountsList(accounts)
+        if (setAsDefault || prefs.getString(KEY_DEFAULT_ACCOUNT_USER, null).isNullOrBlank()) {
+            prefs.edit().putString(KEY_DEFAULT_ACCOUNT_USER, cleanUser).apply()
+        }
+        authCache.clear()
+    }
+
+    private fun deleteSavedAccount(username: String) {
+        val accounts = loadSavedAccounts()
+        accounts.removeAll { it.username.equals(username, ignoreCase = true) }
+        saveAccountsList(accounts)
+        val currentDef = prefs.getString(KEY_DEFAULT_ACCOUNT_USER, null).orEmpty()
+        if (currentDef.equals(username, ignoreCase = true)) {
+            val nextDef = accounts.firstOrNull()?.username.orEmpty()
+            prefs.edit().putString(KEY_DEFAULT_ACCOUNT_USER, nextDef).apply()
+        }
+        authCache.clear()
+    }
+
+    private fun buildAccountStateJsonString(): String {
+        val accounts = loadSavedAccounts()
+        val defAcc = getDefaultSavedAccount()
+        val autoFill = prefs.getBoolean(KEY_AUTO_FILL_ON_LOAD, true)
+        val root = JSONObject()
+        val arr = JSONArray()
+        for (acc in accounts) {
+            val o = JSONObject()
+            o.put("u", acc.username)
+            o.put("p", acc.password)
+            arr.put(o)
+        }
+        root.put("accounts", arr)
+        root.put("defaultUser", defAcc?.username.orEmpty())
+        root.put("autoFill", autoFill)
+        return root.toString()
+    }
+
+    private fun refreshWebPasswordHelper() {
+        val stateJson = JSONObject.quote(buildAccountStateJsonString())
+        webView.post {
+            webView.evaluateJavascript(
+                "window.__stUpdateAccountsState && window.__stUpdateAccountsState($stateJson);",
+                null
+            )
+        }
+    }
+
+    /**
+     * 在网页中注入多账户免解锁自动填入助手：
+     * 1. 自动关闭密码框的手机系统密码保险箱触发（防止弹出“输入设备解锁码/锁屏密码”）；
+     * 2. 当检测到页面存在密码输入框（如酒馆登录页）时，在密码框下方生成内嵌的「账户选择下拉框 + 记住账号密码勾选框 + 自动填入开关」；
+     * 3. 打开登录页面时若已开启自动填入，直接把默认账户的账号和密码填进网页输入框，并触发 input/change 事件；
+     * 4. 当用户勾选“记住账号和密码”并提交登录时，自动将输入的账号密码保存到 App 多账户列表中。
+     */
+    private fun injectPasswordHelperScript() {
+        val initialStateJson = JSONObject.quote(buildAccountStateJsonString())
+        val js = """
+            (function() {
+                window.__stAccountState = JSON.parse($initialStateJson);
+
+                function setNativeInputValue(el, val) {
+                    if (!el) return;
+                    try {
+                        var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                        if (setter) {
+                            setter.call(el, val);
+                        } else {
+                            el.value = val;
+                        }
+                    } catch (e) {
+                        el.value = val;
+                    }
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+
+                function findUsernameInputForPassword(pwdInput) {
+                    var container = pwdInput.closest('form') || pwdInput.parentElement?.parentElement?.parentElement || document.body;
+                    var inputs = Array.from(container.querySelectorAll('input, select'));
+                    var pwdIndex = inputs.indexOf(pwdInput);
+                    var candidate = null;
+                    for (var i = 0; i < inputs.length; i++) {
+                        var inp = inputs[i];
+                        if (inp === pwdInput) break;
+                        var type = (inp.type || 'text').toLowerCase();
+                        if ((type === 'text' || type === 'email' || type === 'tel' || inp.tagName === 'SELECT') &&
+                            inp.offsetParent !== null && !inp.disabled && !inp.readOnly) {
+                            candidate = inp;
+                        }
+                    }
+                    return candidate;
+                }
+
+                function fillAccountToInputs(pwdInput, acc) {
+                    if (!pwdInput || !acc) return;
+                    var userInput = findUsernameInputForPassword(pwdInput);
+                    if (userInput && acc.u && acc.u !== '默认用户') {
+                        setNativeInputValue(userInput, acc.u);
+                    }
+                    setNativeInputValue(pwdInput, acc.p || '');
+                }
+
+                function attachHelperToPasswordInput(pwdInput) {
+                    if (!pwdInput || pwdInput.dataset.stHelperAttached === '1') return;
+                    // 仅对可见的登录密码框挂载（跳过酒馆内部 API Key 等非登录框：若处于主界面设置面板里的 api key 框不干扰）
+                    var idAndName = ((pwdInput.id || '') + ' ' + (pwdInput.name || '') + ' ' + (pwdInput.placeholder || '')).toLowerCase();
+                    if (idAndName.indexOf('api') !== -1 || idAndName.indexOf('key') !== -1 || idAndName.indexOf('secret') !== -1 || idAndName.indexOf('token') !== -1) {
+                        return;
+                    }
+
+                    pwdInput.dataset.stHelperAttached = '1';
+                    pwdInput.setAttribute('autocomplete', 'new-password');
+                    pwdInput.setAttribute('data-lpignore', 'true');
+
+                    var bar = document.createElement('div');
+                    bar.className = '__st_account_helper_bar';
+                    bar.style.cssText = 'margin-top:8px;margin-bottom:8px;padding:10px 12px;background:rgba(28,26,36,0.92);border:1px solid rgba(212,163,89,0.45);border-radius:8px;color:#EAE6F2;font-size:13px;text-align:left;line-height:1.5;box-shadow:0 4px 12px rgba(0,0,0,0.35);';
+
+                    // 第一行：下拉选择已存账户 + 填入按钮 + 管理按钮
+                    var rowTop = document.createElement('div');
+                    rowTop.style.cssText = 'display:flex;align-items:center;gap:6px;flex-wrap:wrap;';
+
+                    var selectEl = document.createElement('select');
+                    selectEl.style.cssText = 'flex:1;min-width:130px;padding:5px 8px;background:#121017;color:#F3C278;border:1px solid #453F59;border-radius:6px;font-size:13px;outline:none;';
+
+                    var btnFill = document.createElement('button');
+                    btnFill.type = 'button';
+                    btnFill.textContent = '填入密码';
+                    btnFill.style.cssText = 'padding:5px 10px;background:#D4A359;color:#15131B;border:none;border-radius:6px;font-weight:bold;font-size:12.5px;cursor:pointer;';
+
+                    var btnManage = document.createElement('button');
+                    btnManage.type = 'button';
+                    btnManage.textContent = '管理';
+                    btnManage.style.cssText = 'padding:5px 8px;background:#2C2838;color:#CFC9DC;border:1px solid #453F59;border-radius:6px;font-size:12px;cursor:pointer;';
+
+                    rowTop.appendChild(selectEl);
+                    rowTop.appendChild(btnFill);
+                    rowTop.appendChild(btnManage);
+
+                    // 第二行：记住账号和密码 + 打开网页自动填入
+                    var rowBottom = document.createElement('div');
+                    rowBottom.style.cssText = 'display:flex;align-items:center;justify-content:space-between;margin-top:8px;flex-wrap:wrap;gap:8px;font-size:12.5px;color:#CFC9DC;';
+
+                    var lblRemember = document.createElement('label');
+                    lblRemember.style.cssText = 'display:inline-flex;align-items:center;gap:5px;cursor:pointer;user-select:none;';
+                    var cbRemember = document.createElement('input');
+                    cbRemember.type = 'checkbox';
+                    cbRemember.checked = true;
+                    lblRemember.appendChild(cbRemember);
+                    lblRemember.appendChild(document.createTextNode('登录时记住账号和密码'));
+
+                    var lblAuto = document.createElement('label');
+                    lblAuto.style.cssText = 'display:inline-flex;align-items:center;gap:5px;cursor:pointer;user-select:none;';
+                    var cbAuto = document.createElement('input');
+                    cbAuto.type = 'checkbox';
+                    cbAuto.checked = !!(window.__stAccountState && window.__stAccountState.autoFill);
+                    lblAuto.appendChild(cbAuto);
+                    lblAuto.appendChild(document.createTextNode('打开时自动填入'));
+
+                    rowBottom.appendChild(lblRemember);
+                    rowBottom.appendChild(lblAuto);
+
+                    bar.appendChild(rowTop);
+                    bar.appendChild(rowBottom);
+
+                    if (pwdInput.parentNode) {
+                        pwdInput.parentNode.insertBefore(bar, pwdInput.nextSibling);
+                    }
+
+                    function renderSelectOptions() {
+                        var st = window.__stAccountState || { accounts: [], defaultUser: '', autoFill: true };
+                        var list = st.accounts || [];
+                        selectEl.innerHTML = '';
+                        cbAuto.checked = !!st.autoFill;
+
+                        if (list.length === 0) {
+                            var optEmpty = document.createElement('option');
+                            optEmpty.value = '';
+                            optEmpty.textContent = '暂无已存账户 (输入登录自动保存)';
+                            selectEl.appendChild(optEmpty);
+                            btnFill.style.display = 'none';
+                        } else {
+                            btnFill.style.display = 'inline-block';
+                            for (var i = 0; i < list.length; i++) {
+                                var item = list[i];
+                                var opt = document.createElement('option');
+                                opt.value = String(i);
+                                opt.textContent = '账户：' + item.u;
+                                if (st.defaultUser && item.u.toLowerCase() === st.defaultUser.toLowerCase()) {
+                                    opt.selected = true;
+                                }
+                                selectEl.appendChild(opt);
+                            }
+                        }
+                    }
+
+                    renderSelectOptions();
+                    bar.__stRenderSelect = renderSelectOptions;
+
+                    // 初次挂载时若开启了“打开时自动填入”，立即自动把默认账户填进输入框
+                    var initState = window.__stAccountState || {};
+                    var initList = initState.accounts || [];
+                    if (initState.autoFill && initList.length > 0 && !pwdInput.value) {
+                        var idx = parseInt(selectEl.value || '0', 10);
+                        var targetAcc = initList[idx] || initList[0];
+                        if (targetAcc) {
+                            fillAccountToInputs(pwdInput, targetAcc);
+                        }
+                    }
+
+                    // 切换下拉框账户时立即自动填入对应账号密码
+                    selectEl.addEventListener('change', function() {
+                        var list = (window.__stAccountState && window.__stAccountState.accounts) || [];
+                        var idx = parseInt(selectEl.value || '0', 10);
+                        var acc = list[idx];
+                        if (acc) {
+                            fillAccountToInputs(pwdInput, acc);
+                            if (window.STAccountBridge) {
+                                window.STAccountBridge.selectDefaultAccountFromWeb(acc.u);
+                            }
+                        }
+                    });
+
+                    btnFill.addEventListener('click', function() {
+                        var list = (window.__stAccountState && window.__stAccountState.accounts) || [];
+                        var idx = parseInt(selectEl.value || '0', 10);
+                        var acc = list[idx] || list[0];
+                        if (acc) {
+                            fillAccountToInputs(pwdInput, acc);
+                        }
+                    });
+
+                    btnManage.addEventListener('click', function() {
+                        if (window.STAccountBridge) {
+                            window.STAccountBridge.openAccountManagerFromWeb();
+                        }
+                    });
+
+                    cbAuto.addEventListener('change', function() {
+                        if (window.__stAccountState) {
+                            window.__stAccountState.autoFill = cbAuto.checked;
+                        }
+                        if (window.STAccountBridge) {
+                            window.STAccountBridge.setAutoFillFromWeb(cbAuto.checked);
+                        }
+                    });
+
+                    // 捕获用户提交登录动作（表单 submit、回车键、点击登录按钮），自动保存账号和密码
+                    function tryCaptureAndSave() {
+                        if (!cbRemember.checked) return;
+                        var pVal = pwdInput.value || '';
+                        if (!pVal) return;
+                        var uInput = findUsernameInputForPassword(pwdInput);
+                        var uVal = (uInput && uInput.value) ? uInput.value.trim() : '默认用户';
+                        if (window.STAccountBridge) {
+                            window.STAccountBridge.saveAccountFromWeb(uVal, pVal);
+                        }
+                    }
+
+                    var form = pwdInput.closest('form');
+                    if (form) {
+                        form.addEventListener('submit', tryCaptureAndSave, true);
+                    }
+                    pwdInput.addEventListener('keydown', function(e) {
+                        if (e.key === 'Enter' || e.keyCode === 13) {
+                            tryCaptureAndSave();
+                        }
+                    }, true);
+
+                    var scope = form || pwdInput.parentElement?.parentElement?.parentElement || document.body;
+                    scope.addEventListener('click', function(e) {
+                        var t = e.target;
+                        while (t && t !== scope) {
+                            var tag = (t.tagName || '').toUpperCase();
+                            var type = (t.type || '').toLowerCase();
+                            if (tag === 'BUTTON' || (tag === 'INPUT' && (type === 'submit' || type === 'button'))) {
+                                if (t !== btnFill && t !== btnManage) {
+                                    tryCaptureAndSave();
+                                }
+                                break;
+                            }
+                            t = t.parentElement;
+                        }
+                    }, true);
+                }
+
+                function scanPasswordInputs() {
+                    var pwdInputs = document.querySelectorAll('input[type="password"]');
+                    for (var i = 0; i < pwdInputs.length; i++) {
+                        var inp = pwdInputs[i];
+                        if (inp.offsetParent !== null) {
+                            attachHelperToPasswordInput(inp);
+                        }
+                    }
+                }
+
+                window.__stUpdateAccountsState = function(newJsonStr) {
+                    try {
+                        window.__stAccountState = JSON.parse(newJsonStr);
+                        var bars = document.querySelectorAll('.__st_account_helper_bar');
+                        for (var i = 0; i < bars.length; i++) {
+                            if (bars[i].__stRenderSelect) {
+                                bars[i].__stRenderSelect();
+                            }
+                        }
+                    } catch (e) {}
+                };
+
+                scanPasswordInputs();
+                if (!window.__stPasswordObserverAdded) {
+                    window.__stPasswordObserverAdded = true;
+                    var obs = new MutationObserver(function() {
+                        scanPasswordInputs();
+                    });
+                    if (document.body) {
+                        obs.observe(document.body, { childList: true, subtree: true });
+                    }
+                }
+            })();
+        """.trimIndent()
+        webView.evaluateJavascript(js, null)
+    }
+
+    /**
      * 弹出酒馆账号密码输入框（用于云酒馆 / 开启 basicAuthMode 的公网酒馆）
+     * 支持：
+     * 1. 顶部下拉框一键选择已保存的多账户并自动填入；
+     * 2. 手动输入时勾选“记住此账号和密码”；
+     * 3. 勾选“下次自动使用默认账户登录”；
+     * 4. 直接打开账户管理器增删改账户。
      */
     private fun showHttpAuthDialog(
         handler: HttpAuthHandler,
@@ -1044,38 +1540,308 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         realm: String,
         onCredentials: (String, String) -> Unit
     ) {
+        val accounts = loadSavedAccounts()
+        val defaultAccount = getDefaultSavedAccount()
+
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(22), dp(12), dp(22), 0)
+            setPadding(dp(22), dp(12), dp(22), dp(4))
         }
+
         val etUser = EditText(this).apply {
             hint = "用户名"
-            inputType = InputType.TYPE_CLASS_TEXT
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
             setSingleLine()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO
+            }
         }
         val etPass = EditText(this).apply {
             hint = "密码"
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
             setSingleLine()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO
+            }
         }
+
+        // 若已有保存的账户，顶部提供“选择已存账户”下拉框，点选立刻自动填好账号密码
+        if (accounts.isNotEmpty()) {
+            val tvSelectLabel = TextView(this).apply {
+                text = "选择已保存的账户（点选自动填密码）："
+                textSize = 12.5f
+                setPadding(0, 0, 0, dp(4))
+            }
+            val spinner = Spinner(this)
+            val labels = accounts.map { "账户：${it.username}" }
+            val adapter = ArrayAdapter(
+                this,
+                android.R.layout.simple_spinner_dropdown_item,
+                labels
+            )
+            spinner.adapter = adapter
+
+            val defaultIdx = if (defaultAccount != null) {
+                accounts.indexOfFirst {
+                    it.username.equals(defaultAccount.username, ignoreCase = true)
+                }.coerceAtLeast(0)
+            } else {
+                0
+            }
+            spinner.setSelection(defaultIdx)
+            etUser.setText(accounts[defaultIdx].username)
+            etPass.setText(accounts[defaultIdx].password)
+
+            spinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                override fun onItemSelected(
+                    parent: AdapterView<*>?,
+                    view: View?,
+                    position: Int,
+                    id: Long
+                ) {
+                    val acc = accounts.getOrNull(position) ?: return
+                    etUser.setText(acc.username)
+                    etPass.setText(acc.password)
+                }
+
+                override fun onNothingSelected(parent: AdapterView<*>?) {}
+            }
+
+            container.addView(tvSelectLabel)
+            container.addView(spinner)
+        }
+
         container.addView(etUser)
         container.addView(etPass)
 
+        val cbRemember = CheckBox(this).apply {
+            text = "记住此账号和密码（存到多账户列表）"
+            isChecked = true
+            textSize = 13f
+        }
+        val cbAutoLogin = CheckBox(this).apply {
+            text = "下次打开直接用此账户自动登录"
+            isChecked = prefs.getBoolean(KEY_AUTO_LOGIN_HTTP_AUTH, true)
+            textSize = 13f
+        }
+        container.addView(cbRemember)
+        container.addView(cbAutoLogin)
+
         AlertDialog.Builder(this)
-            .setTitle("酒馆需要登录")
-            .setMessage(
-                "服务器 $host 要求输入账号密码（即酒馆配置里 basicAuthMode 设置的账号）。\n" +
-                    "认证域：${realm.ifBlank { "默认" }}"
-            )
+            .setTitle("酒馆需要登录 ($host)")
             .setView(container)
             .setCancelable(false)
             .setPositiveButton("登录") { _, _ ->
-                val user = etUser.text?.toString().orEmpty()
+                val user = etUser.text?.toString()?.trim().orEmpty()
                 val pass = etPass.text?.toString().orEmpty()
+                prefs.edit().putBoolean(KEY_AUTO_LOGIN_HTTP_AUTH, cbAutoLogin.isChecked).apply()
+                if (cbRemember.isChecked && (user.isNotEmpty() || pass.isNotEmpty())) {
+                    upsertSavedAccount(user.ifEmpty { "默认用户" }, pass, setAsDefault = true)
+                } else if (user.isNotEmpty()) {
+                    prefs.edit().putString(KEY_DEFAULT_ACCOUNT_USER, user).apply()
+                }
                 onCredentials(user, pass)
                 handler.proceed(user, pass)
             }
+            .setNeutralButton("管理账户") { _, _ ->
+                showAccountManagerDialog(onChanged = {
+                    showHttpAuthDialog(handler, host, realm, onCredentials)
+                })
+            }
             .setNegativeButton("取消") { _, _ -> handler.cancel() }
+            .show()
+    }
+
+    /**
+     * 小齿轮设置里的「多账户管理 / 编辑弹窗」：
+     * 支持查看所有已保存账户、切换默认自动填充账户、新增账户、修改账号密码、删除账户。
+     */
+    private fun showAccountManagerDialog(onChanged: (() -> Unit)? = null) {
+        val accounts = loadSavedAccounts()
+        val defaultUser = getDefaultSavedAccount()?.username.orEmpty()
+
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(12), dp(20), dp(8))
+        }
+
+        val cbAutoFillWeb = CheckBox(this).apply {
+            text = "打开网页登录页时自动填入默认账户密码"
+            isChecked = prefs.getBoolean(KEY_AUTO_FILL_ON_LOAD, true)
+            textSize = 13.5f
+            setOnCheckedChangeListener { _, isChecked ->
+                prefs.edit().putBoolean(KEY_AUTO_FILL_ON_LOAD, isChecked).apply()
+                onChanged?.invoke()
+            }
+        }
+        val cbAutoLoginHttp = CheckBox(this).apply {
+            text = "遇到弹窗认证时自动使用默认账户登录"
+            isChecked = prefs.getBoolean(KEY_AUTO_LOGIN_HTTP_AUTH, true)
+            textSize = 13.5f
+            setOnCheckedChangeListener { _, isChecked ->
+                prefs.edit().putBoolean(KEY_AUTO_LOGIN_HTTP_AUTH, isChecked).apply()
+            }
+        }
+        root.addView(cbAutoFillWeb)
+        root.addView(cbAutoLoginHttp)
+
+        val listTitle = TextView(this).apply {
+            text = if (accounts.isEmpty()) {
+                "\n当前还没有保存的账户。\n你可以点下方「+ 新增账户」提前填好，或在登录页面勾选「记住账号和密码」。"
+            } else {
+                "\n点击账户可设为「默认填入」或编辑/删除（当前共 ${accounts.size} 个）："
+            }
+            textSize = 13f
+            setPadding(0, dp(4), 0, dp(8))
+        }
+        root.addView(listTitle)
+
+        var managerDialog: AlertDialog? = null
+
+        for (acc in accounts) {
+            val isDefault = acc.username.equals(defaultUser, ignoreCase = true)
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                setPadding(dp(8), dp(8), dp(8), dp(8))
+            }
+
+            val tvInfo = TextView(this).apply {
+                layoutParams = LinearLayout.LayoutParams(
+                    0,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    1f
+                )
+                text = if (isDefault) "★ ${acc.username}  (默认自动填入)" else "   ${acc.username}"
+                textSize = 14.5f
+                setOnClickListener {
+                    prefs.edit().putString(KEY_DEFAULT_ACCOUNT_USER, acc.username).apply()
+                    authCache.clear()
+                    Toast.makeText(
+                        this@MainActivity,
+                        "已将「${acc.username}」设为默认自动填入账户",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                    managerDialog?.dismiss()
+                    onChanged?.invoke()
+                    showAccountManagerDialog(onChanged)
+                }
+            }
+
+            val btnEdit = Button(this).apply {
+                text = "编辑"
+                textSize = 12f
+                minWidth = 0
+                minimumWidth = 0
+                setPadding(dp(10), dp(4), dp(10), dp(4))
+                setOnClickListener {
+                    managerDialog?.dismiss()
+                    showAddOrEditAccountDialog(existing = acc) {
+                        onChanged?.invoke()
+                        showAccountManagerDialog(onChanged)
+                    }
+                }
+            }
+
+            val btnDel = Button(this).apply {
+                text = "删除"
+                textSize = 12f
+                minWidth = 0
+                minimumWidth = 0
+                setPadding(dp(10), dp(4), dp(10), dp(4))
+                setOnClickListener {
+                    deleteSavedAccount(acc.username)
+                    Toast.makeText(
+                        this@MainActivity,
+                        "已删除账户：${acc.username}",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                    managerDialog?.dismiss()
+                    onChanged?.invoke()
+                    showAccountManagerDialog(onChanged)
+                }
+            }
+
+            row.addView(tvInfo)
+            row.addView(btnEdit)
+            row.addView(btnDel)
+            root.addView(row)
+        }
+
+        managerDialog = AlertDialog.Builder(this)
+            .setTitle("多账户管理 (免设备解锁码自动填充)")
+            .setView(root)
+            .setPositiveButton("+ 新增账户") { _, _ ->
+                showAddOrEditAccountDialog(existing = null) {
+                    onChanged?.invoke()
+                    showAccountManagerDialog(onChanged)
+                }
+            }
+            .setNegativeButton("完成") { _, _ ->
+                onChanged?.invoke()
+            }
+            .create()
+
+        managerDialog.show()
+    }
+
+    /**
+     * 新增或编辑单个账户弹窗
+     */
+    private fun showAddOrEditAccountDialog(
+        existing: SavedAccount?,
+        onSaved: () -> Unit
+    ) {
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(22), dp(14), dp(22), dp(4))
+        }
+        val etUser = EditText(this).apply {
+            hint = "账号 / 用户名（若酒馆只有密码框可填“默认用户”）"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            setSingleLine()
+            setText(existing?.username.orEmpty())
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO
+            }
+        }
+        val etPass = EditText(this).apply {
+            hint = "密码"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
+            setSingleLine()
+            setText(existing?.password.orEmpty())
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO
+            }
+        }
+        val cbSetDefault = CheckBox(this).apply {
+            text = "设为默认自动填入账户"
+            isChecked = true
+            textSize = 13.5f
+        }
+        container.addView(etUser)
+        container.addView(etPass)
+        container.addView(cbSetDefault)
+
+        AlertDialog.Builder(this)
+            .setTitle(if (existing == null) "新增酒馆账户" else "编辑账户：${existing.username}")
+            .setView(container)
+            .setPositiveButton("保存") { _, _ ->
+                val newUser = etUser.text?.toString()?.trim().orEmpty().ifEmpty { "默认用户" }
+                val newPass = etPass.text?.toString().orEmpty()
+                if (newPass.isEmpty()) {
+                    Toast.makeText(this, "密码不能为空", Toast.LENGTH_SHORT).show()
+                    return@setPositiveButton
+                }
+                if (existing != null && !existing.username.equals(newUser, ignoreCase = true)) {
+                    deleteSavedAccount(existing.username)
+                }
+                upsertSavedAccount(newUser, newPass, setAsDefault = cbSetDefault.isChecked)
+                Toast.makeText(this, "已保存账户：$newUser", Toast.LENGTH_SHORT).show()
+                onSaved()
+            }
+            .setNegativeButton("取消") { _, _ ->
+                onSaved()
+            }
             .show()
     }
 
@@ -1208,10 +1974,30 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
         val dialogView = LayoutInflater.from(this).inflate(R.layout.dialog_settings, null)
         val etServerUrl = dialogView.findViewById<EditText>(R.id.etServerUrl)
+        val tvSavedAccountsSummary = dialogView.findViewById<TextView>(R.id.tvSavedAccountsSummary)
+        val btnManageAccounts = dialogView.findViewById<Button>(R.id.btnManageAccounts)
         val switchKeepScreenOn = dialogView.findViewById<SwitchCompat>(R.id.switchKeepScreenOn)
         val switchKeepBgAlive = dialogView.findViewById<SwitchCompat>(R.id.switchKeepBgAlive)
         val switchOpenExternalBrowser = dialogView.findViewById<SwitchCompat>(R.id.switchOpenExternalBrowser)
         val switchShowFloatingBtn = dialogView.findViewById<SwitchCompat>(R.id.switchShowFloatingBtn)
+
+        fun updateAccountsSummaryText() {
+            val list = loadSavedAccounts()
+            val def = getDefaultSavedAccount()
+            tvSavedAccountsSummary.text = if (list.isEmpty()) {
+                "已保存账户：0 个"
+            } else {
+                "已保存账户：${list.size} 个（默认：${def?.username.orEmpty()}）"
+            }
+        }
+        updateAccountsSummaryText()
+
+        btnManageAccounts.setOnClickListener {
+            showAccountManagerDialog(onChanged = {
+                updateAccountsSummaryText()
+                refreshWebPasswordHelper()
+            })
+        }
 
         val currentUrl = prefs.getString(KEY_SERVER_URL, null)
             ?.takeIf { it.isNotBlank() }
