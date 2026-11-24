@@ -69,6 +69,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         private const val KEY_SERVER_URL = "server_url"
         private const val KEY_KEEP_SCREEN_ON = "keep_screen_on"
         private const val KEY_KEEP_BG_ALIVE = "keep_bg_alive"
+        private const val KEY_OPEN_EXTERNAL_BROWSER = "open_external_browser"
         private const val KEY_SHOW_FLOATING_BTN = "show_floating_btn"
 
         private const val DEFAULT_URL_TEMPLATE = "http://192.168.1.100:8000"
@@ -270,11 +271,16 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
     /**
      * 拦截系统返回键和全面屏侧滑返回手势：
-     * 无论当前处于何种页面状态，均需在 2 秒内连续触发两次返回才退出 App，防止在酒馆打字或滑动时误触侧滑直接关掉酒馆。
+     * - 方案二：若当前在软件内跳转到了其它网页或子页面（webView.canGoBack() 为 true），单次按下返回键直接退回上一页；
+     * - 若已回到酒馆顶层页面，则需在 2 秒内连续触发两次返回才退出 App，防止打字或滑动时误触直接退出酒馆。
      */
     private fun setupBackPressInterceptor() {
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
+                if (webView.canGoBack()) {
+                    webView.goBack()
+                    return
+                }
                 val now = SystemClock.elapsedRealtime()
                 if (now - lastBackPressTime < EXIT_CONFIRM_INTERVAL_MS) {
                     finish()
@@ -288,6 +294,43 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 }
             }
         })
+    }
+
+    /**
+     * 判断某个链接是否属于当前配置的酒馆服务器（同域名/IP + 同端口）
+     */
+    private fun isSameHostAsTavern(targetUri: Uri): Boolean {
+        val savedUrl = prefs.getString(KEY_SERVER_URL, null)?.trim().orEmpty()
+        if (savedUrl.isEmpty()) return true
+        val tavernUri = try {
+            Uri.parse(normalizeServerUrl(savedUrl))
+        } catch (_: Exception) {
+            return true
+        }
+        val tavernHost = tavernUri.host?.lowercase(Locale.ROOT).orEmpty()
+        val targetHost = targetUri.host?.lowercase(Locale.ROOT).orEmpty()
+        if (tavernHost.isEmpty() || targetHost.isEmpty()) return true
+        if (tavernHost != targetHost) return false
+
+        val tavernPort = if (tavernUri.port != -1) tavernUri.port else defaultPortForScheme(tavernUri.scheme)
+        val targetPort = if (targetUri.port != -1) targetUri.port else defaultPortForScheme(targetUri.scheme)
+        return tavernPort == targetPort
+    }
+
+    private fun defaultPortForScheme(scheme: String?): Int {
+        return when (scheme?.lowercase(Locale.ROOT)) {
+            "https" -> 443
+            "http" -> 80
+            else -> -1
+        }
+    }
+
+    private fun openInSystemBrowser(uri: Uri) {
+        try {
+            startActivity(Intent(Intent.ACTION_VIEW, uri))
+        } catch (e: Exception) {
+            Toast.makeText(this, "未找到可用的外部浏览器", Toast.LENGTH_SHORT).show()
+        }
     }
 
     /**
@@ -306,6 +349,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             allowFileAccess = true
             allowContentAccess = true
             javaScriptCanOpenWindowsAutomatically = true
+            setSupportMultipleWindows(true)
             mediaPlaybackRequiresUserGesture = false
 
             // 放行 HTTP/HTTPS 混合内容（例如局域网 HTTP 酒馆引用外部资源或本地图床）
@@ -332,14 +376,17 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             ): Boolean {
                 val uri = request?.url ?: return false
                 val scheme = uri.scheme?.lowercase(Locale.ROOT).orEmpty()
-                return if (scheme == "http" || scheme == "https") {
-                    false // 由当前 WebView 加载
-                } else {
-                    try {
-                        startActivity(Intent(Intent.ACTION_VIEW, uri))
-                    } catch (_: Exception) {
+                if (scheme == "http" || scheme == "https") {
+                    // 若开启了“在浏览器打开跳转网站”且目标地址不是酒馆自身，则拉起手机系统浏览器打开
+                    val openExternal = prefs.getBoolean(KEY_OPEN_EXTERNAL_BROWSER, true)
+                    if (openExternal && request?.isForMainFrame == true && !isSameHostAsTavern(uri)) {
+                        openInSystemBrowser(uri)
+                        return true
                     }
-                    true
+                    return false // 由当前 WebView 加载
+                } else {
+                    openInSystemBrowser(uri)
+                    return true
                 }
             }
 
@@ -407,8 +454,43 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             }
         }
 
-        // 完整实现 onShowFileChooser：支持导入 PNG 角色卡、JSON 世界书/预设/正则/聊天记录等任意文件
+        // 完整实现 onShowFileChooser 及 target="_blank" / window.open 新窗口跳转拦截
         webView.webChromeClient = object : WebChromeClient() {
+            override fun onCreateWindow(
+                view: WebView?,
+                isDialog: Boolean,
+                isUserGesture: Boolean,
+                resultMsg: android.os.Message?
+            ): Boolean {
+                // 处理扩展管理里 target="_blank" 或 window.open 触发的链接（如 GitHub 扩展主页）
+                val transport = resultMsg?.obj as? WebView.WebViewTransport ?: return false
+                val tempWebView = WebView(this@MainActivity)
+                tempWebView.webViewClient = object : WebViewClient() {
+                    override fun shouldOverrideUrlLoading(
+                        tempView: WebView?,
+                        request: WebResourceRequest?
+                    ): Boolean {
+                        val targetUri = request?.url
+                        if (targetUri != null) {
+                            val scheme = targetUri.scheme?.lowercase(Locale.ROOT).orEmpty()
+                            val openExternal = prefs.getBoolean(KEY_OPEN_EXTERNAL_BROWSER, true)
+                            if ((scheme != "http" && scheme != "https") ||
+                                (openExternal && !isSameHostAsTavern(targetUri))
+                            ) {
+                                openInSystemBrowser(targetUri)
+                            } else {
+                                webView.loadUrl(targetUri.toString())
+                            }
+                        }
+                        tempView?.destroy()
+                        return true
+                    }
+                }
+                transport.webView = tempWebView
+                resultMsg.sendToTarget()
+                return true
+            }
+
             override fun onProgressChanged(view: WebView?, newProgress: Int) {
                 if (newProgress in 1..99) {
                     progressBar.visibility = View.VISIBLE
@@ -986,17 +1068,12 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             </head>
             <body>
                 <div class="card">
-                    <h2>未连接到局域网酒馆</h2>
+                    <h2>未连接到SillyTavern</h2>
                     <p>当前地址：<span class="code">$failingUrl</span></p>
                     <p>错误信息：$errorDescription</p>
                     <div class="tips">
                         <strong>排查建议：</strong><br/>
-                        1. 不要填 127.0.0.1 或 localhost：它们在手机里指的是手机自己，请填电脑的局域网 IP（如 192.168.1.100）。<br/>
-                        2. 确认手机与运行 SillyTavern 的电脑连接同一个 Wi-Fi / 路由器。<br/>
-                        3. 确认酒馆 <span class="code">config.yaml</span> 中已开启 <span class="code">listen: true</span>，并把 <span class="code">whitelistMode</span> 设为 false 或加入手机 IP。<br/>
-                        4. 确认电脑防火墙已放行 8000 端口（Windows 首次运行 Node.js 时弹窗要选“允许访问”）。<br/>
-                        5. 先用手机浏览器打开同一地址试一下，能打开说明网络通了，再回到本 App。<br/>
-                        6. 点击屏幕<strong>右上角半透明小齿轮</strong>（或<strong>摇一摇手机</strong>）修改 IP 与端口。
+                        点击屏幕<strong>右上角半透明小齿轮</strong>（或<strong>摇一摇手机</strong>）修改 IP 与端口。
                     </div>
                     <a class="btn" href="$failingUrl">重新连接</a>
                 </div>
@@ -1018,6 +1095,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         val etServerUrl = dialogView.findViewById<EditText>(R.id.etServerUrl)
         val switchKeepScreenOn = dialogView.findViewById<SwitchCompat>(R.id.switchKeepScreenOn)
         val switchKeepBgAlive = dialogView.findViewById<SwitchCompat>(R.id.switchKeepBgAlive)
+        val switchOpenExternalBrowser = dialogView.findViewById<SwitchCompat>(R.id.switchOpenExternalBrowser)
         val switchShowFloatingBtn = dialogView.findViewById<SwitchCompat>(R.id.switchShowFloatingBtn)
 
         val currentUrl = prefs.getString(KEY_SERVER_URL, null)
@@ -1032,10 +1110,13 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         val currentKeepBgAlive = prefs.getBoolean(KEY_KEEP_BG_ALIVE, true)
         switchKeepBgAlive.isChecked = currentKeepBgAlive
 
+        val currentOpenExternalBrowser = prefs.getBoolean(KEY_OPEN_EXTERNAL_BROWSER, true)
+        switchOpenExternalBrowser.isChecked = currentOpenExternalBrowser
+
         val currentShowFloating = prefs.getBoolean(KEY_SHOW_FLOATING_BTN, true)
         switchShowFloatingBtn.isChecked = currentShowFloating
 
-        // 实时切换防息屏开关
+        // 实时切换保持屏幕常亮开关（拨动滑块立即生效并持久化保存，无需点“保存并连接”）
         switchKeepScreenOn.setOnCheckedChangeListener { _, isChecked ->
             prefs.edit().putBoolean(KEY_KEEP_SCREEN_ON, isChecked).apply()
             applyKeepScreenOn(isChecked)
@@ -1043,7 +1124,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             Toast.makeText(this, getString(msgRes), Toast.LENGTH_SHORT).show()
         }
 
-        // 实时切换强制后台运行（防切屏/息屏被系统杀后台断连）开关
+        // 实时切换强制后台运行开关（拨动滑块立即生效并持久化保存，无需点“保存并连接”）
         switchKeepBgAlive.setOnCheckedChangeListener { _, isChecked ->
             prefs.edit().putBoolean(KEY_KEEP_BG_ALIVE, isChecked).apply()
             applyKeepBackgroundAlive(isChecked, askBatteryOptimization = isChecked)
@@ -1051,7 +1132,14 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             Toast.makeText(this, getString(msgRes), Toast.LENGTH_SHORT).show()
         }
 
-        // 实时切换右上角半透明快捷按钮显示/隐藏
+        // 实时切换“在浏览器打开跳转网站”开关（拨动滑块立即生效并持久化保存）
+        switchOpenExternalBrowser.setOnCheckedChangeListener { _, isChecked ->
+            prefs.edit().putBoolean(KEY_OPEN_EXTERNAL_BROWSER, isChecked).apply()
+            val msgRes = if (isChecked) R.string.external_browser_enabled else R.string.external_browser_disabled
+            Toast.makeText(this, getString(msgRes), Toast.LENGTH_SHORT).show()
+        }
+
+        // 实时切换右上角半透明快捷按钮显示/隐藏（拨动滑块立即生效并持久化保存）
         switchShowFloatingBtn.setOnCheckedChangeListener { _, isChecked ->
             prefs.edit().putBoolean(KEY_SHOW_FLOATING_BTN, isChecked).apply()
             applyFloatingButtonVisibility(isChecked)
@@ -1099,6 +1187,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                     .putString(KEY_SERVER_URL, normalized)
                     .putBoolean(KEY_KEEP_SCREEN_ON, switchKeepScreenOn.isChecked)
                     .putBoolean(KEY_KEEP_BG_ALIVE, switchKeepBgAlive.isChecked)
+                    .putBoolean(KEY_OPEN_EXTERNAL_BROWSER, switchOpenExternalBrowser.isChecked)
                     .putBoolean(KEY_SHOW_FLOATING_BTN, switchShowFloatingBtn.isChecked)
                     .apply()
 

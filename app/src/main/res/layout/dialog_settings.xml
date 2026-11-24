@@ -57,6 +57,14 @@
             android:textSize="14sp" />
 
         <androidx.appcompat.widget.SwitchCompat
+            android:id="@+id/switchOpenExternalBrowser"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="@string/open_external_in_browser"
+            android:textSize="14sp" />
+
+        <androidx.appcompat.widget.SwitchCompat
             android:id="@+id/switchShowFloatingBtn"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
