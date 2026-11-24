@@ -86,6 +86,11 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private lateinit var progressBar: ProgressBar
     private lateinit var btnQuickSettings: TextView
 
+    // 站外网页浮层（第二层 WebView）：跳转站外链接时用它打开，酒馆主页面完全不会被顶掉、返回时也不会刷新
+    private lateinit var overlayContainer: FrameLayout
+    private lateinit var overlayWebView: WebView
+    private lateinit var btnCloseOverlay: TextView
+
     // 文件选择器回调（用于导入 PNG 角色卡、JSON 世界书/预设/正则/聊天记录等）
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
 
@@ -149,6 +154,13 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         webView = findViewById(R.id.webView)
         progressBar = findViewById(R.id.progressBar)
         btnQuickSettings = findViewById(R.id.btnQuickSettings)
+        overlayContainer = findViewById(R.id.overlayContainer)
+        overlayWebView = findViewById(R.id.overlayWebView)
+        btnCloseOverlay = findViewById(R.id.btnCloseOverlay)
+
+        // 站外网页浮层：关闭按钮 + 独立 WebView
+        btnCloseOverlay.setOnClickListener { closeOverlayPage() }
+        setupOverlayWebView()
 
         // 1. 隐藏顶部状态栏与底部导航栏，并确保软键盘弹出时自动顶起 WebView 底部输入框（不遮挡酒馆发送栏）
         setupImmersiveFullscreenAndKeyboardResize()
@@ -271,12 +283,21 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
     /**
      * 拦截系统返回键和全面屏侧滑返回手势：
-     * - 方案二：若当前在软件内跳转到了其它网页或子页面（webView.canGoBack() 为 true），单次按下返回键直接退回上一页；
-     * - 若已回到酒馆顶层页面，则需在 2 秒内连续触发两次返回才退出 App，防止打字或滑动时误触直接退出酒馆。
+     * 1. 若站外网页浮层正在显示：浮层内部可后退就后退，不能后退就关闭浮层回到酒馆（酒馆主页面不会被刷新）；
+     * 2. 否则若酒馆 WebView 自身还能后退（酒馆内部子页面），单次按下直接退回上一页；
+     * 3. 若已回到酒馆顶层页面，则需在 2 秒内连续触发两次返回才退出 App，防止打字或滑动时误触直接退出酒馆。
      */
     private fun setupBackPressInterceptor() {
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
+                if (isOverlayShowing()) {
+                    if (overlayWebView.canGoBack()) {
+                        overlayWebView.goBack()
+                    } else {
+                        closeOverlayPage()
+                    }
+                    return
+                }
                 if (webView.canGoBack()) {
                     webView.goBack()
                     return
@@ -294,6 +315,93 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 }
             }
         })
+    }
+
+    private fun isOverlayShowing(): Boolean =
+        overlayContainer.visibility == View.VISIBLE
+
+    /**
+     * 在浮层里打开站外网页（例如扩展管理的 GitHub 页面），
+     * 关键在于【不触碰酒馆这个 WebView】，所以关掉浮层回来时酒馆页面还是原样、不会刷新。
+     */
+    private fun showOverlayPage(url: String) {
+        overlayContainer.visibility = View.VISIBLE
+        overlayContainer.bringToFront()
+        overlayWebView.loadUrl(url)
+    }
+
+    private fun closeOverlayPage() {
+        if (!isOverlayShowing()) return
+        overlayContainer.visibility = View.GONE
+        try {
+            overlayWebView.stopLoading()
+            overlayWebView.loadUrl("about:blank")
+            overlayWebView.clearHistory()
+        } catch (_: Exception) {
+        }
+        hideSystemBars()
+    }
+
+    /**
+     * 浮层 WebView 的独立配置：只负责浏览站外网页，绝不影响酒馆主页面
+     */
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun setupOverlayWebView() {
+        overlayWebView.settings.apply {
+            javaScriptEnabled = true
+            domStorageEnabled = true
+            databaseEnabled = true
+            useWideViewPort = true
+            loadWithOverviewMode = true
+            setSupportZoom(true)
+            builtInZoomControls = true
+            displayZoomControls = false
+            mediaPlaybackRequiresUserGesture = false
+            mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+        }
+
+        overlayWebView.setBackgroundColor(0xFF0E0D12.toInt())
+
+        overlayWebView.webViewClient = object : WebViewClient() {
+            override fun shouldOverrideUrlLoading(
+                view: WebView?,
+                request: WebResourceRequest?
+            ): Boolean {
+                val uri = request?.url ?: return false
+                val scheme = uri.scheme?.lowercase(Locale.ROOT).orEmpty()
+                if (scheme == "http" || scheme == "https") {
+                    return false // 站外网页继续在浮层里浏览
+                }
+                openInSystemBrowser(uri)
+                return true
+            }
+        }
+
+        overlayWebView.webChromeClient = object : WebChromeClient() {
+            // 浮层里的 target="_blank" / window.open 也直接在浮层内打开，不弹新窗口
+            override fun onCreateWindow(
+                view: WebView?,
+                isDialog: Boolean,
+                isUserGesture: Boolean,
+                resultMsg: android.os.Message?
+            ): Boolean {
+                val transport = resultMsg?.obj as? WebView.WebViewTransport ?: return false
+                val tempWebView = WebView(this@MainActivity)
+                tempWebView.webViewClient = object : WebViewClient() {
+                    override fun shouldOverrideUrlLoading(
+                        tempView: WebView?,
+                        request: WebResourceRequest?
+                    ): Boolean {
+                        request?.url?.let { overlayWebView.loadUrl(it.toString()) }
+                        tempView?.destroy()
+                        return true
+                    }
+                }
+                transport.webView = tempWebView
+                resultMsg.sendToTarget()
+                return true
+            }
+        }
     }
 
     /**
@@ -375,15 +483,23 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 request: WebResourceRequest?
             ): Boolean {
                 val uri = request?.url ?: return false
+                // 只拦截「主页面」跳转；酒馆内部 iframe / 子框架继续在内层正常加载
+                if (request?.isForMainFrame != true) return false
+
                 val scheme = uri.scheme?.lowercase(Locale.ROOT).orEmpty()
                 if (scheme == "http" || scheme == "https") {
-                    // 若开启了“在浏览器打开跳转网站”且目标地址不是酒馆自身，则拉起手机系统浏览器打开
+                    // 酒馆自身地址：正常在本 WebView 里加载
+                    if (isSameHostAsTavern(uri)) return false
+
+                    // 站外链接（如扩展管理里的 GitHub 页面）：绝不加载进酒馆这个 WebView，
+                    // 否则返回时酒馆会被重新加载（表现为“返回后主页刷新”）
                     val openExternal = prefs.getBoolean(KEY_OPEN_EXTERNAL_BROWSER, true)
-                    if (openExternal && request?.isForMainFrame == true && !isSameHostAsTavern(uri)) {
+                    if (openExternal) {
                         openInSystemBrowser(uri)
-                        return true
+                    } else {
+                        showOverlayPage(uri.toString())
                     }
-                    return false // 由当前 WebView 加载
+                    return true
                 } else {
                     openInSystemBrowser(uri)
                     return true
@@ -474,12 +590,11 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                         if (targetUri != null) {
                             val scheme = targetUri.scheme?.lowercase(Locale.ROOT).orEmpty()
                             val openExternal = prefs.getBoolean(KEY_OPEN_EXTERNAL_BROWSER, true)
-                            if ((scheme != "http" && scheme != "https") ||
-                                (openExternal && !isSameHostAsTavern(targetUri))
-                            ) {
-                                openInSystemBrowser(targetUri)
-                            } else {
-                                webView.loadUrl(targetUri.toString())
+                            when {
+                                scheme != "http" && scheme != "https" -> openInSystemBrowser(targetUri)
+                                isSameHostAsTavern(targetUri) -> webView.loadUrl(targetUri.toString())
+                                openExternal -> openInSystemBrowser(targetUri)
+                                else -> showOverlayPage(targetUri.toString())
                             }
                         }
                         tempView?.destroy()
@@ -1253,6 +1368,11 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     override fun onDestroy() {
         KeepAliveService.stop(this)
         settingsDialog?.dismiss()
+
+        (overlayWebView.parent as? ViewGroup)?.removeView(overlayWebView)
+        overlayWebView.stopLoading()
+        overlayWebView.destroy()
+
         (webView.parent as? ViewGroup)?.removeView(webView)
         webView.stopLoading()
         webView.destroy()

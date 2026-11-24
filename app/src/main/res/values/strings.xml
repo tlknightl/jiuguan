@@ -6,6 +6,7 @@
     <string name="keep_screen_on">保持屏幕常亮</string>
     <string name="keep_background_alive">强制后台运行</string>
     <string name="open_external_in_browser">在浏览器打开跳转网站</string>
+    <string name="close_overlay">关闭并返回酒馆</string>
     <string name="show_floating_btn">显示右上角半透明快捷按钮 (关闭后仍可摇一摇呼出)</string>
     <string name="btn_save_and_load">保存并连接</string>
     <string name="btn_reload">刷新当前页</string>
