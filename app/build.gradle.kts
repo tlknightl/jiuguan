@@ -15,14 +15,25 @@ android {
         versionName = "1.0.2"
     }
 
+    signingConfigs {
+        create("stable") {
+            storeFile = file("sillytavern-release.jks")
+            storePassword = "sillytavern"
+            keyAlias = "sillytavern"
+            keyPassword = "sillytavern"
+        }
+    }
+
     buildTypes {
         debug {
             isMinifyEnabled = false
             isDebuggable = true
+            signingConfig = signingConfigs.getByName("stable")
         }
         release {
             isMinifyEnabled = true
             isShrinkResources = true
+            signingConfig = signingConfigs.getByName("stable")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
